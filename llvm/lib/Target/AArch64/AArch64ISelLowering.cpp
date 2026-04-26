@@ -20346,6 +20346,75 @@ static SDValue performVectorExtCombine(SDNode *N, SelectionDAG &DAG) {
   return SDValue();
 }
 
+// Combine (zext i8 to iN) * 0x010101... into a NEON byte broadcast using dup.
+static SDValue performMulBroadcastCombine(SDNode *N, SelectionDAG &DAG,
+                                          const AArch64Subtarget *Subtarget) {
+  EVT MulVT = N->getValueType(0);
+  if (!MulVT.isInteger() || MulVT.isVector() || !Subtarget->hasNEON())
+    return SDValue();
+
+  SDValue N0 = N->getOperand(0);
+  SDValue N1 = N->getOperand(1);
+
+  // Check if one operand is a constant
+  ConstantSDNode *C = dyn_cast<ConstantSDNode>(N1);
+  if (!C) {
+    C = dyn_cast<ConstantSDNode>(N0);
+    if (C)
+      std::swap(N0, N1);
+  }
+
+  if (!C)
+    return SDValue();
+
+  const APInt &ConstValue = C->getAPIntValue();
+  unsigned BitWidth = ConstValue.getBitWidth();
+
+  // Check pattern requirements:
+  // 1. Result type must be 32, 64, or 128 bits
+  // 2. Other operand must be zext from i8
+  if (BitWidth != 32 && BitWidth != 64 && BitWidth != 128)
+    return SDValue();
+
+  if (N0->getOpcode() != ISD::ZERO_EXTEND ||
+      N0->getOperand(0).getValueType() != MVT::i8)
+    return SDValue();
+
+  // Check if the constant is a byte broadcast pattern: 0x01010101...
+  // Check 32 bits (4 bytes) at a time instead of 8 bits (1 byte).
+  static const APInt Broadcast32 = APInt(32, 0x01010101U);
+  bool IsBroadcastPattern = true;
+  for (unsigned I = 32; I < BitWidth; I += 32) {
+    if (ConstValue.extractBits(32, I) != Broadcast32) {
+      IsBroadcastPattern = false;
+      break;
+    }
+  }
+
+  if (!IsBroadcastPattern || ConstValue.extractBits(32, 0) != Broadcast32)
+    return SDValue();
+
+  SDLoc DL(N);
+
+  // Determine the vector type based on the scalar type
+  MVT VecVT;
+  if (BitWidth == 32)
+    VecVT = MVT::v4i8;   // 4 bytes
+  else if (BitWidth == 64)
+    VecVT = MVT::v8i8;   // 8 bytes
+  else // BitWidth == 128
+    VecVT = MVT::v16i8;  // 16 bytes
+
+  // Build a vector from the extended byte
+  // This creates a BUILD_VECTOR which will later be selected to dup
+  SDValue ByteVal = N0->getOperand(0);
+  SmallVector<SDValue, 16> Elements(VecVT.getVectorNumElements(), ByteVal);
+  SDValue BroadcastVec = DAG.getNode(ISD::BUILD_VECTOR, DL, VecVT, Elements);
+
+  // Bitcast the vector to match the scalar type for the store
+  return DAG.getNode(ISD::BITCAST, DL, MulVT, BroadcastVec);
+}
+
 static SDValue performMulCombine(SDNode *N, SelectionDAG &DAG,
                                  TargetLowering::DAGCombinerInfo &DCI,
                                  const AArch64Subtarget *Subtarget) {
@@ -20356,6 +20425,9 @@ static SDValue performMulCombine(SDNode *N, SelectionDAG &DAG,
     return Ext;
   if (SDValue Ext = performVectorExtCombine(N, DAG))
     return Ext;
+  if (SDValue Ext = performMulBroadcastCombine(N, DAG, Subtarget))
+    return Ext;
+
   if (DCI.isBeforeLegalizeOps())
     return SDValue();
 
