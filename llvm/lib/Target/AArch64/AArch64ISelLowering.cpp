@@ -20346,6 +20346,56 @@ static SDValue performVectorExtCombine(SDNode *N, SelectionDAG &DAG) {
   return SDValue();
 }
 
+// Combine (zext i8 to iN) * 0x010101... into a NEON byte broadcast using dup.
+static SDValue performMulBroadcastCombine(SDNode *N, SelectionDAG &DAG,
+                                          TargetLowering::DAGCombinerInfo &DCI,
+                                          const AArch64Subtarget *Subtarget) {
+  EVT MulVT = N->getValueType(0);
+  if (!MulVT.isInteger() || MulVT.isVector() || !Subtarget->hasNEON())
+    return SDValue();
+
+  SDValue N0 = N->getOperand(0);
+  SDValue N1 = N->getOperand(1);
+
+  ConstantSDNode *C = dyn_cast<ConstantSDNode>(N1);
+  if (!C)
+    return SDValue();
+
+  const APInt &ConstValue = C->getAPIntValue();
+  unsigned BitWidth = ConstValue.getBitWidth();
+
+  if (N0->getOpcode() != ISD::ZERO_EXTEND ||
+      N0->getOperand(0).getValueType() != MVT::i8)
+    return SDValue();
+
+  // Check if the constant is a byte broadcast pattern: 0x01010101...
+  if (!ConstValue.isSplat(8) || ConstValue.extractBits(8, 0) != 0x01)
+    return SDValue();
+
+  if (BitWidth != 32 && BitWidth != 64)
+    return SDValue();
+
+  if (BitWidth == 32 && !DCI.isBeforeLegalizeOps())
+    return SDValue();
+
+  if (!DAG.getTargetLoweringInfo().isTypeLegal(MVT::v8i8))
+    return SDValue();
+
+  SDLoc DL(N);
+
+  MVT VecVT;
+  if (BitWidth == 32)
+    VecVT = MVT::v4i8; // type legalizer will handle v4i8
+  else if (BitWidth == 64)
+    VecVT = MVT::v8i8;
+
+  // Build a splat vector from the extended byte.
+  SDValue ByteVal = N0->getOperand(0);
+  SDValue BroadcastVec = DAG.getSplatBuildVector(VecVT, DL, ByteVal);
+
+  return DAG.getNode(ISD::BITCAST, DL, MulVT, BroadcastVec);
+}
+
 static SDValue performMulCombine(SDNode *N, SelectionDAG &DAG,
                                  TargetLowering::DAGCombinerInfo &DCI,
                                  const AArch64Subtarget *Subtarget) {
@@ -20355,6 +20405,8 @@ static SDValue performMulCombine(SDNode *N, SelectionDAG &DAG,
   if (SDValue Ext = performMulVectorCmpZeroCombine(N, DAG))
     return Ext;
   if (SDValue Ext = performVectorExtCombine(N, DAG))
+    return Ext;
+  if (SDValue Ext = performMulBroadcastCombine(N, DAG, DCI, Subtarget))
     return Ext;
   if (DCI.isBeforeLegalizeOps())
     return SDValue();
